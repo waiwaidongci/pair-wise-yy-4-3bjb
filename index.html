@@ -29,7 +29,20 @@
     .timeline { display: grid; gap: 8px; max-height: 240px; overflow: auto; }
     .pill { display: inline-block; padding: 3px 8px; border: 1px solid #c9dadc; border-radius: 999px; font-size: 12px; }
     .muted { color: #5c7378; font-size: 13px; }
-    @media (max-width: 980px) { header { display: block; } .app { grid-template-columns: 1fr; } .map { height: 560px; } }
+    .care-station { margin: 0 16px 16px; }
+    .care-grid { display: grid; grid-template-columns: 320px 1fr 1fr; gap: 16px; }
+    .care-grid h3 { margin: 10px 0 8px; }
+    .care-grid h4 { margin: 12px 0 6px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; margin: 2px 4px 2px 0; }
+    .badge.risk { background: #fbe3e0; color: #a33327; border: 1px solid #e5a89f; }
+    .badge.ok { background: #e2f3e5; color: #2c6e3f; border: 1px solid #a9d3b2; }
+    .countdown { font-weight: 800; }
+    .countdown.overdue { color: #a33327; }
+    .seg { border-left: 3px solid #1d6c78; padding: 4px 8px; margin: 4px 0; background: #f2f8f9; border-radius: 0 6px 6px 0; font-size: 13px; }
+    .seg.closed { border-color: #9db4b8; background: #f6f8f8; color: #5c7378; }
+    .checkline { display: flex; gap: 8px; align-items: center; margin: 6px 0; font-size: 13px; color: #5c7378; }
+    .checkline input { width: auto; }
+    @media (max-width: 980px) { header { display: block; } .app { grid-template-columns: 1fr; } .map { height: 560px; } .care-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -62,6 +75,37 @@
       <div id="list" class="list"></div>
     </aside>
   </main>
+  <section class="panel care-station">
+    <h2>出水晾护交接台</h2>
+    <div class="muted">登记出水时刻、材质、含水率与当前容器；木质件离水30分钟须入保湿箱，陶片含水率高于18%先阴干、不得入恒湿柜。</div>
+    <div class="care-grid">
+      <div>
+        <h3>出水登记</h3>
+        <form id="careForm">
+          <label>关联标记</label>
+          <select id="careMark"></select>
+          <label>编号</label><input name="code" required>
+          <label>出水时刻</label><input name="recoveredAt" type="datetime-local" required>
+          <label>材质</label>
+          <select name="material"><option value="wood">木构件</option><option value="ceramic">陶片</option><option value="metal">金属件</option><option value="unknown">未知物</option></select>
+          <label>含水率(%)</label><input name="moisture" type="number" min="0" max="100" step="0.1" required>
+          <label>当前容器</label>
+          <select name="container"><option>海水桶</option><option>保湿箱</option><option>阴干架</option><option>恒湿柜</option><option>转运箱</option></select>
+          <div class="toolbar"><button>登记出水</button></div>
+        </form>
+        <h3>风险清单</h3>
+        <div id="riskList" class="list"></div>
+      </div>
+      <div>
+        <h3>待办（按剩余时限排序）</h3>
+        <div id="todoList" class="list"></div>
+      </div>
+      <div>
+        <h3>交接与容器档案</h3>
+        <div id="detailBody" class="muted">从待办或风险清单选择一条记录。</div>
+      </div>
+    </div>
+  </section>
   <script>
     const map = document.querySelector("#map");
     const form = document.querySelector("#form");
@@ -149,6 +193,191 @@
     };
     filter.onchange = render; view.onchange = render;
     render();
+  </script>
+  <script>
+    /* ================= 判定层：纯规则，不碰存储与界面 ================= */
+    const CARE_RULES = { woodBoxLimitMs: 30 * 60 * 1000, ceramicMoistureMax: 18 };
+    const CARE_CONTAINERS = ["海水桶", "保湿箱", "阴干架", "恒湿柜", "转运箱"];
+    function currentSegment(rec) { return rec.segments[rec.segments.length - 1]; }
+    // 输入一条记录与当前时刻，输出风险、待办与最近剩余时限（毫秒，负数为已超时）
+    function judgeCare(rec, now = Date.now()) {
+      const risks = [], todos = [];
+      const cur = currentSegment(rec);
+      const recovered = new Date(rec.recoveredAt).getTime();
+      if (rec.material === "wood" && cur.container !== "保湿箱") {
+        const remaining = recovered + CARE_RULES.woodBoxLimitMs - now;
+        if (remaining <= 0) risks.push("木质件离水超30分钟未入保湿箱");
+        todos.push({ text: "移入保湿箱", remaining });
+      }
+      if (rec.material === "ceramic" && rec.moisture > CARE_RULES.ceramicMoistureMax) {
+        if (cur.container === "恒湿柜") {
+          risks.push(`含水率${rec.moisture}%高于${CARE_RULES.ceramicMoistureMax}%，禁止存放恒湿柜`);
+          todos.push({ text: "立即移出恒湿柜，转阴干架", remaining: -1 });
+        } else if (cur.container !== "阴干架") {
+          todos.push({ text: "含水率偏高，先阴干（转阴干架）", remaining: 0 });
+        }
+      }
+      const remaining = todos.length ? Math.min(...todos.map(t => t.remaining)) : null;
+      return { risks, todos, remaining };
+    }
+  </script>
+  <script>
+    /* ================= 档案层：记录、容器段与交接的存取 ================= */
+    const CareStore = {
+      key: "zfl30Care",
+      records: [],
+      load() { this.records = JSON.parse(localStorage.getItem(this.key) || "[]"); },
+      save() { localStorage.setItem(this.key, JSON.stringify(this.records)); },
+      get(id) { return this.records.find(r => r.id === id); },
+      add({ markCode, material, recoveredAt, moisture, container }) {
+        const rec = { id: crypto.randomUUID(), markCode, material, recoveredAt, moisture, segments: [{ container, start: recoveredAt, end: null }], handovers: [], log: [] };
+        this.log(rec.id, `登记出水，入${container}`, recoveredAt);
+        this.records.push(rec); this.save();
+        return rec;
+      },
+      // 换容器：封闭旧段、开启新段，并重算风险写入档案
+      changeContainer(id, container, at = new Date().toISOString()) {
+        const rec = this.get(id); if (!rec) return;
+        const cur = currentSegment(rec);
+        if (cur.container === container) return;
+        cur.end = at;
+        rec.segments.push({ container, start: at, end: null });
+        this.log(id, `容器变更：${cur.container} → ${container}`, at);
+        const { risks } = judgeCare(rec, Date.now());
+        this.log(id, risks.length ? "重算风险：" + risks.join("；") : "重算风险：无风险", at);
+        this.save();
+      },
+      updateMoisture(id, moisture) {
+        const rec = this.get(id); if (!rec) return;
+        this.log(id, `含水率复测：${rec.moisture}% → ${moisture}%`);
+        rec.moisture = moisture; this.save();
+      },
+      handover(id, { by, containerChecked, prevChecked, note }) {
+        const rec = this.get(id); if (!rec) return;
+        const cur = currentSegment(rec);
+        rec.handovers.push({ by, at: new Date().toISOString(), container: cur.container, prevStart: cur.start, containerChecked, prevChecked, note });
+        this.log(id, `保管员${by}接手（容器核对${containerChecked ? "通过" : "未过"}，上步时间核对${prevChecked ? "通过" : "未过"}）`);
+        this.save();
+      },
+      log(id, text, at = new Date().toISOString()) {
+        const rec = this.get(id); if (rec) rec.log.push({ at, text });
+      }
+    };
+    CareStore.load();
+    if (!CareStore.records.length) {
+      const ago = min => new Date(Date.now() - min * 60000).toISOString();
+      CareStore.add({ markCode: "W-003", material: "wood", recoveredAt: ago(22), moisture: 64, container: "海水桶" });
+      CareStore.add({ markCode: "A-017", material: "ceramic", recoveredAt: ago(120), moisture: 21.5, container: "转运箱" });
+    }
+  </script>
+  <script>
+    /* ================= 界面层：只读判定层与档案层，负责渲染与交互 ================= */
+    const careForm = document.querySelector("#careForm");
+    const careMark = document.querySelector("#careMark");
+    const todoList = document.querySelector("#todoList");
+    const riskList = document.querySelector("#riskList");
+    const detailBody = document.querySelector("#detailBody");
+    let selectedCare = null;
+    const fmtTime = iso => new Date(iso).toLocaleString("zh-CN", { hour12: false });
+    function fmtRemain(ms) {
+      const s = Math.abs(Math.round(ms / 1000)), m = Math.floor(s / 60), h = Math.floor(m / 60);
+      const txt = h ? `${h}小时${m % 60}分` : `${m}分${String(s % 60).padStart(2, "0")}秒`;
+      return ms < 0 ? "已超时 " + txt : "剩余 " + txt;
+    }
+    function fillCareMarks() {
+      careMark.innerHTML = '<option value="">— 手动编号 —</option>' + marks.map(m => `<option value="${m.id}">${m.code} · ${typeNames[m.type]}</option>`).join("");
+    }
+    careMark.onchange = () => {
+      const mark = marks.find(m => m.id === careMark.value);
+      if (mark) { careForm.code.value = mark.code; careForm.material.value = mark.type; }
+    };
+    careForm.onsubmit = event => {
+      event.preventDefault();
+      const d = Object.fromEntries(new FormData(careForm).entries());
+      const rec = CareStore.add({ markCode: d.code.trim(), material: d.material, recoveredAt: new Date(d.recoveredAt).toISOString(), moisture: Number(d.moisture), container: d.container });
+      selectedCare = rec.id;
+      careForm.reset();
+      careForm.recoveredAt.value = localNow();
+      renderCare();
+    };
+    function localNow() {
+      return new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    }
+    function renderCare() { renderTodos(); renderRisks(); renderCareDetail(); }
+    function renderTodos() {
+      const rows = CareStore.records.map(rec => ({ rec, j: judgeCare(rec) })).filter(x => x.j.todos.length);
+      rows.sort((a, b) => a.j.remaining - b.j.remaining);
+      todoList.innerHTML = rows.length ? rows.map(({ rec, j }) =>
+        `<div class="item ${rec.id === selectedCare ? "active" : ""}" data-id="${rec.id}"><b>${rec.markCode}</b> <span class="pill">${typeNames[rec.material]}</span> <span class="pill">${currentSegment(rec).container}</span>
+        <div>${j.todos.map(t => t.text).join("；")}</div>
+        <div class="countdown ${j.remaining < 0 ? "overdue" : ""}">${fmtRemain(j.remaining)}</div></div>`
+      ).join("") : '<div class="muted">暂无待办。</div>';
+      todoList.querySelectorAll("[data-id]").forEach(el => el.onclick = () => { selectedCare = el.dataset.id; renderCare(); });
+    }
+    function renderRisks() {
+      const rows = CareStore.records.map(rec => ({ rec, j: judgeCare(rec) })).filter(x => x.j.risks.length);
+      riskList.innerHTML = rows.length ? rows.map(({ rec, j }) =>
+        `<div class="item ${rec.id === selectedCare ? "active" : ""}" data-id="${rec.id}"><b>${rec.markCode}</b> <span class="pill">${typeNames[rec.material]}</span>
+        ${j.risks.map(r => `<div class="badge risk">⚠ ${r}</div>`).join("")}</div>`
+      ).join("") : '<div class="badge ok">当前无风险记录</div>';
+      riskList.querySelectorAll("[data-id]").forEach(el => el.onclick = () => { selectedCare = el.dataset.id; renderCare(); });
+    }
+    function renderCareDetail() {
+      const rec = CareStore.get(selectedCare);
+      if (!rec) { detailBody.className = "muted"; detailBody.textContent = "从待办或风险清单选择一条记录。"; return; }
+      const j = judgeCare(rec);
+      const cur = currentSegment(rec);
+      detailBody.className = "";
+      detailBody.innerHTML = `
+        <div><b>${rec.markCode}</b> <span class="pill">${typeNames[rec.material]}</span> <span class="pill">${cur.container}</span></div>
+        <div class="muted">出水时刻：${fmtTime(rec.recoveredAt)} · 含水率：${rec.moisture}%</div>
+        ${j.risks.length ? j.risks.map(r => `<div class="badge risk">⚠ ${r}</div>`).join("") : '<div class="badge ok">无风险</div>'}
+        <h4>容器段（换容器保留旧段）</h4>
+        ${rec.segments.map(s => `<div class="seg ${s.end ? "closed" : ""}">${s.container} · ${fmtTime(s.start)} → ${s.end ? fmtTime(s.end) : "至今"}</div>`).join("")}
+        <h4>换容器</h4>
+        <form id="segForm" class="toolbar">
+          <select name="container">${CARE_CONTAINERS.map(c => `<option ${c === cur.container ? "selected" : ""}>${c}</option>`).join("")}</select>
+          <button type="submit">换容器并重算风险</button>
+        </form>
+        <h4>含水率复测</h4>
+        <form id="moistForm" class="toolbar">
+          <input name="moisture" type="number" min="0" max="100" step="0.1" value="${rec.moisture}" required>
+          <button type="submit">更新</button>
+        </form>
+        <h4>保管员交接</h4>
+        <div class="muted">接手前请核对：当前容器 <b>${cur.container}</b>；上一步时间 <b>${fmtTime(cur.start)}</b></div>
+        <form id="handoverForm">
+          <label>保管员</label><input name="by" required placeholder="姓名">
+          <div class="checkline"><input type="checkbox" name="containerChecked" id="ck1"><label for="ck1" style="margin:0">已核对当前容器</label></div>
+          <div class="checkline"><input type="checkbox" name="prevChecked" id="ck2"><label for="ck2" style="margin:0">已核对上一步时间</label></div>
+          <label>交接备注</label><input name="note" placeholder="如容器与记录不符请说明">
+          <div class="toolbar"><button type="submit">确认接手</button></div>
+        </form>
+        <h4>档案日志</h4>
+        ${rec.handovers.map(h => `<div class="muted">${fmtTime(h.at)} · ${h.by}接手（容器核对${h.containerChecked ? "✓" : "✗"} 时间核对${h.prevChecked ? "✓" : "✗"}）${h.note ? " · " + h.note : ""}</div>`).join("")}
+        ${rec.log.map(l => `<div class="muted">${fmtTime(l.at)} · ${l.text}</div>`).join("")}`;
+      detailBody.querySelector("#segForm").onsubmit = e => {
+        e.preventDefault();
+        CareStore.changeContainer(rec.id, new FormData(e.target).get("container"));
+        renderCare();
+      };
+      detailBody.querySelector("#moistForm").onsubmit = e => {
+        e.preventDefault();
+        CareStore.updateMoisture(rec.id, Number(new FormData(e.target).get("moisture")));
+        renderCare();
+      };
+      detailBody.querySelector("#handoverForm").onsubmit = e => {
+        e.preventDefault();
+        const d = new FormData(e.target);
+        if (!d.get("containerChecked") || !d.get("prevChecked")) { alert("接手前必须核对当前容器和上一步时间。"); return; }
+        CareStore.handover(rec.id, { by: d.get("by").trim(), containerChecked: true, prevChecked: true, note: d.get("note").trim() });
+        renderCare();
+      };
+    }
+    careForm.recoveredAt.value = localNow();
+    fillCareMarks();
+    renderCare();
+    setInterval(() => { renderTodos(); renderRisks(); }, 15000);
   </script>
 </body>
 </html>
